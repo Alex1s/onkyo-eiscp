@@ -1,8 +1,12 @@
+import asyncio
+import logging
 import re
 import struct
 import time
 import socket, select
 import threading
+from asyncio import Queue, Future, AbstractEventLoop
+
 import xmltodict
 import json
 try:
@@ -279,7 +283,7 @@ def filter_for_message(getter_func, msg):
         # exception for HDMI-CEC commands (CTV) since they don't provide any response/confirmation
         if "CTV" in msg[:3]:
             return msg
-        
+
         # The protocol docs claim that a response  should arrive
         # within *50ms or the communication has failed*. In my tests,
         # however, the interval needed to be at least 200ms before
@@ -348,7 +352,7 @@ class eISCP(object):
                 sock.bind((ifaddr["addr"], 0))
                 sock.sendto(onkyo_magic, (ifaddr["broadcast"], eISCP.ONKYO_PORT))
                 sock.sendto(pioneer_magic, (ifaddr["broadcast"], eISCP.ONKYO_PORT))
-        
+
                 while True:
                     ready = select.select([sock], [], [], timeout)
                     if not ready[0]:
@@ -356,13 +360,13 @@ class eISCP(object):
                     data, addr = sock.recvfrom(1024)
 
                     info = parse_info(data)
-        
+
                     # Give the user a ready-made receiver instance. It will only
                     # connect on demand, when actually used.
                     receiver = (clazz or eISCP)(addr[0], int(info['iscp_port']))
                     receiver.info = info
                     found_receivers[info["identifier"]]=receiver
-        
+
                 sock.close()
         return list(found_receivers.values())
 
@@ -676,3 +680,142 @@ class Receiver(eISCP):
 
         finally:
             eISCP.disconnect(self)
+
+
+Request = namedtuple('Request', "command future")
+
+
+def normalized_command_to_command_str(normalized_command: tuple[str, str] | tuple[str, tuple[str, str]]):
+    """Ensures that various ways to refer to a command can be used."""
+    command = normalized_command[0]
+    argument = normalized_command[-1][0] if isinstance(normalized_command[-1], tuple) else normalized_command[-1]
+    return f'{command}={argument}'
+
+
+class AsyncReceiver:
+    def __init__(self, host: str, port: int, event_loop: AbstractEventLoop = None, priorities=None, logger=logging.getLogger('onkyo-eiscp')):
+        if event_loop is None:
+            event_loop = asyncio.get_running_loop()
+        if priorities is None:
+            priorities = ['power=on', 'volume=10']
+        priorities = [iscp_to_command(command_to_iscp(priority))[0] for priority in priorities]
+
+        self.__host = host
+        self.__port = port
+        self.__event_loop = event_loop
+        self.__priorities = priorities
+
+        self.__send_queue = list()
+        self.__queue_has_request = self.__event_loop.create_future()
+        self.__reader, self.__writer = None, None
+        self.__state = dict()
+
+        self.__last_request = self.__other_requests = None
+
+        self.__logger = logger
+
+    def queue_append(self, item):
+        self.__send_queue.append(item)
+        self.__queue_has_request.set_result('item appended')
+        self.__logger.debug('queue append before destroy')
+        self.__queue_has_request = self.__event_loop.create_future()
+        self.__logger.debug('queue append after destroy')
+
+    async def queue_wait_for_append(self):
+        await self.__queue_has_request
+        self.__logger.debug('queue wait before destroy')
+        self.__queue_has_request = self.__event_loop.create_future()
+        self.__logger.debug('queue wait after destroy')
+
+    async def __read_loop(self):
+        while True:
+            header_bytes = await self.__reader.read(16)
+            header = eISCPPacket.parse_header(header_bytes)
+            body_bytes = await self.__reader.read(header.data_size)
+            iscp_message = ISCPMessage.parse(body_bytes.decode())
+            command = iscp_to_command(iscp_message)
+
+            self.__state[command[0]] = command[1]
+            self.__logger.debug(f'state {command[0]} changed to {command[1]}')
+            # print(self.__state)
+
+            if self.__last_request is not None:
+                self.__logger.debug(f'{command} ?= {self.__last_request.command}')
+            if self.__last_request is not None and self.__last_request.command == command:
+                self.__request_fulfilled()
+
+    def __request_fulfilled(self):
+        self.__last_request.future.set_result(self.__last_request.command)
+        if self.__other_requests is not None:
+            for other_request in self.__other_requests:
+                other_request.future.set_result(self.__last_request.command)
+
+    async def __handle_priorities(self) -> bool:
+        """:returns true if a priority has been handled, false if no priority has been handled"""
+        for priority in self.__priorities:
+            prio_requests = [request for request in self.__send_queue if request.command[0] == priority]
+            self.__send_queue = [request for request in self.__send_queue if request not in prio_requests]
+            if len(prio_requests) != 0:
+                self.__last_request = prio_requests[-1]
+                self.__other_requests = prio_requests[:-1]
+                self.__logger.debug(f'skipping {len(self.__other_requests)} requests of priority {priority}')
+
+                current_state = self.__state.get(self.__last_request.command[0])
+
+                if current_state is not None and current_state == self.__last_request.command[1]:
+                    self.__logger.info(f'skipping command "{self.__last_request.command}" because receiver is already in correct state.')
+                    self.__request_fulfilled()
+                else:
+                    command_str = normalized_command_to_command_str(self.__last_request.command)
+                    b = command_to_packet(command_to_iscp(command_str))
+                    self.__logger.debug(f'sending data: {b}')
+                    self.__writer.write(b)
+                    await self.__writer.drain()
+                    await self.__last_request.future
+                    self.__last_request = self.__other_requests = None
+                return True
+        return False
+
+    async def __write_loop(self):
+        while True:
+            if len(self.__send_queue) == 0:
+                self.__logger.debug('waiting for queue append')
+                await self.queue_wait_for_append()
+                self.__logger.debug('queue got an append')
+            self.__queue_has_request = self.__event_loop.create_future()
+
+            repeat = await self.__handle_priorities()
+            if repeat:
+                continue
+
+            request = self.__send_queue[0]
+            self.__send_queue = self.__send_queue[1:]
+
+            self.__last_request = request
+            self.__other_requests = None
+            await self.__writer.write(eISCPPacket(command_to_iscp(request.command)).get_raw())
+
+            await request.future
+
+    async def connect(self):
+        assert (self.__reader is not None and self.__writer is not None) or (self.__reader is None and self.__writer is None)
+        if self.__reader is None or self.__writer is None:
+            self.__logger.debug('connecting')
+            self.__reader, self.__writer = await asyncio.open_connection(self.__host, self.__port)
+            self.__logger.debug('connected')
+            self.__event_loop.create_task(self.__read_loop())
+            self.__event_loop.create_task(self.__write_loop())
+
+    async def command(self, command: str, argument: str | list[str] = None, zone: str = None):
+        await self.connect()
+        normal_command = iscp_to_command(command_to_iscp(command, argument, zone))
+
+        future = self.__event_loop.create_future()
+
+        self.queue_append(Request(normal_command, future))
+        result = await future
+        return result
+
+
+
+
