@@ -803,6 +803,7 @@ class AsyncReceiver:
             self.__logger.debug('connecting')
             self.__reader, self.__writer = await asyncio.open_connection(self.__host, self.__port)
             self.__logger.debug('connected')
+            self.__state = {}
             self.__event_loop.create_task(self.__read_loop())
             self.__event_loop.create_task(self.__write_loop())
 
